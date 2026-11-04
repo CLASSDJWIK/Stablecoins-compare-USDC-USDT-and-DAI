@@ -1,0 +1,585 @@
+---
+title: "Stablecoins on Ethereum: USDC, USDT and DAI"
+subtitle: "Transfer sizes and gross transfer volumes"
+author: "[Your name and surname]"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: false
+    theme: flatly
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(httr2)
+  library(lubridate)
+  library(scales)
+})
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 5.5
+)
+
+# Two separate, one-hour observation windows. No data from the gap is used.
+periods <- tibble::tibble(
+  day = c("2026-10-01", "2026-10-02"),
+  start = as.POSIXct(c("2026-10-01 12:00:00", "2026-10-02 12:00:00"), tz = "UTC"),
+  end = as.POSIXct(c("2026-10-01 13:00:00", "2026-10-02 13:00:00"), tz = "UTC")
+)
+stopifnot(all(periods$start < periods$end), all(periods$end <= Sys.time()))
+
+stablecoins <- tibble::tribble(
+  ~token, ~contract, ~expected_decimals,
+  "USDC", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", 6L,
+  "USDT", "0xdac17f958d2ee523a2206206994597c13d831ec7", 6L,
+  "DAI",  "0x6b175474e89094c44da98b954eedeac495271d0f", 18L
+)
+
+PAGE_SIZE <- 1000L
+API_URL <- "https://api.etherscan.io/v2/api"
+
+# Files have explicit start/end times, preventing accidental cache reuse.
+period_id <- function(from, to) {
+  paste0(format(from, "%Y%m%dT%H%M%S", tz = "UTC"), "Z_",
+         format(to, "%Y%m%dT%H%M%S", tz = "UTC"), "Z")
+}
+
+dir.create("data", showWarnings = FALSE)
+dir.create("data/cache", recursive = TRUE, showWarnings = FALSE)
+dir.create("outputs", showWarnings = FALSE)
+dir.create("figures", showWarnings = FALSE)
+
+fmt_number <- function(x, accuracy = 0.01) {
+  scales::comma(x, accuracy = accuracy, big.mark = ",")
+}
+```
+
+# 1. Setup
+
+We compare three major Ethereum stablecoins: **USDC**, **USDT** and **DAI**. The analysis focuses on two questions: **(1)** how their transfer sizes differ, and **(2)** how much transfer volume each stablecoin generates. The workflow is: **Ethereum → Etherscan → ERC-20 transfer events → R / tidyverse → transfer sizes + transfer volumes**.
+
+### Observation period
+
+We compare ERC-20 transfers during **two separate one-hour windows** on Ethereum mainnet: **1 October 2026, 12:00–13:00 UTC**, and **2 October 2026, 12:00–13:00 UTC**. Using the same clock hour on two dates makes it possible to compare the tokens without mixing in the intervening 23 hours.
+
+
+
+### Token contracts
+
+Each token has its own Ethereum contract address. The decimals column tells us how to turn the integer amount returned by the API into a readable token amount: USDC and USDT use 6 decimal places, while DAI uses 18.
+
+```{r contracts}
+knitr::kable(
+  stablecoins |>
+    select(token, contract, expected_decimals),
+  col.names = c("Stablecoin", "Ethereum contract address", "Decimals"),
+  caption = "ERC-20 contracts used in the analysis",
+  align = c("l", "l", "r")
+)
+```
+
+### Etherscan connection and data preparation
+
+The API key is read from `~/.Renviron` when data still need to be downloaded. The check below reports whether the variable is present; it does **not** validate the key with Etherscan, and the secret itself is never printed.
+
+```{r api-key-check, echo=TRUE}
+# Controllo della chiave, senza mostrarne il valore.
+api_key <- trimws(Sys.getenv("ETHERSCAN_API_KEY"))
+
+if (nzchar(api_key)) {
+  cat("SUCCESS: Etherscan API key found locally (not yet validated by the server).\n")
+} else {
+  cat("API key not configured: the second observation hour requires a valid key.\n")
+}
+```
+
+The request uses Etherscan API V2 (`tokentx`) and the contract addresses shown above.
+
+Before analysing the amounts, we convert the raw token values to token units using the decimals for each contract.
+```{r api-functions}
+etherscan_get <- function(parameters, max_tries = 5L) {
+  key <- Sys.getenv("ETHERSCAN_API_KEY")
+  if (!nzchar(key)) {
+    stop("Missing ETHERSCAN_API_KEY. Put it in ~/.Renviron and restart R.")
+  }
+
+  params <- c(list(chainid = 1L), parameters, list(apikey = key))
+
+  for (attempt in seq_len(max_tries)) {
+    Sys.sleep(0.45) # Below the Free-tier rate of 3 requests/second.
+    req <- httr2::request(API_URL)
+    req <- do.call(httr2::req_url_query, c(list(req), params))
+    req <- httr2::req_timeout(req, 60)
+    req <- httr2::req_retry(req, max_tries = 3)
+
+    response <- tryCatch(httr2::req_perform(req), error = identity)
+    if (inherits(response, "error")) {
+      if (attempt == max_tries) stop(conditionMessage(response))
+      Sys.sleep(attempt)
+      next
+    }
+
+    body <- httr2::resp_body_json(response, simplifyVector = FALSE)
+    if (identical(body$status, "1")) return(body)
+
+    details <- paste(unlist(body[c("message", "result")]), collapse = " ")
+    if (grepl("No transactions found", details, ignore.case = TRUE)) return(body)
+
+    temporary <- grepl(
+      "rate limit|too many requests|temporar|timeout|busy|server error",
+      details, ignore.case = TRUE
+    )
+    if (grepl("invalid api key|missing.*api key", details, ignore.case = TRUE)) {
+      stop("Etherscan rejected ETHERSCAN_API_KEY. Check the key at https://etherscan.io/myapikey, update ~/.Renviron and restart R. API response: ", details)
+    }
+    if (!temporary || attempt == max_tries) {
+      stop("Etherscan API error: ", details)
+    }
+    Sys.sleep(attempt * 2)
+  }
+  stop("Etherscan did not return a usable response.")
+}
+
+block_before <- function(datetime) {
+  result <- etherscan_get(list(
+    module = "block", action = "getblocknobytime",
+    timestamp = as.integer(as.numeric(datetime)), closest = "before"
+  ))$result
+  block <- as.integer(result)
+  if (length(block) != 1L || is.na(block)) {
+    stop("Invalid block number received from Etherscan.")
+  }
+  block
+}
+
+transfer_page <- function(contract, first, last, page = 1L) {
+  response <- etherscan_get(list(
+    module = "account", action = "tokentx",
+    contractaddress = contract,
+    startblock = first, endblock = last,
+    page = page, offset = PAGE_SIZE, sort = "asc"
+  ))
+  if (identical(response$status, "0")) return(list())
+  if (!is.list(response$result)) stop("Unexpected tokentx response.")
+  response$result
+}
+
+fetch_block_range <- function(contract, first, last) {
+  if (first > last) return(list())
+  page1 <- transfer_page(contract, first, last)
+  if (length(page1) < PAGE_SIZE) return(page1)
+
+  if (first < last) {
+    mid <- floor((first + last) / 2)
+    return(c(fetch_block_range(contract, first, mid),
+             fetch_block_range(contract, mid + 1L, last)))
+  }
+
+  # An exceptionally busy single block cannot be split further.
+  events <- page1
+  page <- 2L
+  repeat {
+    next_page <- transfer_page(contract, first, last, page)
+    if (identical(next_page, page1)) {
+      stop("Pagination repeated the first page within block ", first)
+    }
+    events <- c(events, next_page)
+    if (length(next_page) < PAGE_SIZE) break
+    if (page >= 10L) {
+      stop("Single-block pagination limit reached; completeness is not assured.")
+    }
+    page <- page + 1L
+  }
+  events
+}
+
+raw_to_units <- function(value, decimals) {
+  stopifnot(length(value) == 1L, grepl("^[0-9]+$", value))
+  digits <- sub("^0+", "", value)
+  if (!nzchar(digits)) digits <- "0"
+  decimals <- as.integer(decimals)
+  if (decimals == 0L) return(as.numeric(digits))
+  digits <- stringr::str_pad(digits, width = decimals + 1L, pad = "0")
+  split <- nchar(digits) - decimals
+  as.numeric(paste0(
+    substr(digits, 1L, split), ".",
+    substr(digits, split + 1L, nchar(digits))
+  ))
+}
+
+stopifnot(
+  isTRUE(all.equal(raw_to_units("1234567", 6L), 1.234567)),
+  isTRUE(all.equal(raw_to_units("1230000000000000000", 18L), 1.23)),
+  identical(raw_to_units("0", 6L), 0)
+)
+
+empty_transfers <- function() {
+  tibble(token = character(), datetime_utc = as.POSIXct(character(), tz = "UTC"),
+         amount = numeric(), hash = character(), block = integer())
+}
+
+clean_chunk <- function(events, token, contract, decimals, from, to) {
+  if (!length(events)) return(empty_transfers())
+
+  data <- tibble(
+    token = token,
+    contract = purrr::map_chr(events, "contractAddress"),
+    block = as.integer(purrr::map_chr(events, "blockNumber")),
+    epoch = as.numeric(purrr::map_chr(events, "timeStamp")),
+    hash = purrr::map_chr(events, "hash"),
+    raw_value = purrr::map_chr(events, "value"),
+    decimals = as.integer(purrr::map_chr(events, "tokenDecimal"))
+  )
+
+  if (any(tolower(data$contract) != tolower(contract)) ||
+      any(is.na(data$decimals)) || any(data$decimals != decimals)) {
+    stop("Wrong contract or decimals returned for ", token)
+  }
+
+  data |>
+    mutate(datetime_utc = as.POSIXct(epoch, origin = "1970-01-01", tz = "UTC")) |>
+    filter(datetime_utc >= from, datetime_utc < to) |>
+    mutate(amount = purrr::map2_dbl(raw_value, decimals, raw_to_units)) |>
+    select(token, datetime_utc, amount, hash, block)
+}
+
+fetch_chunk <- function(token, contract, decimals, from, to) {
+  chunk_id <- paste0(
+    token, "_", format(from, "%Y%m%dT%H%M%S", tz = "UTC"), "Z_",
+    format(to, "%Y%m%dT%H%M%S", tz = "UTC"), "Z"
+  )
+  path <- file.path("data", "cache", paste0(chunk_id, ".rds"))
+  if (file.exists(path)) return(readRDS(path))
+
+  first <- block_before(from)
+  last <- block_before(to)
+  records <- fetch_block_range(contract, first, last)
+  result <- clean_chunk(records, token, contract, decimals, from, to)
+  # Avoid leaving a broken cache file if an R session is interrupted.
+  temp_path <- paste0(path, ".tmp")
+  saveRDS(result, temp_path)
+  if (!file.rename(temp_path, path)) stop("Could not save chunk cache: ", path)
+  result
+}
+```
+
+```{r collect-data}
+# The included 1 October CSV is reused. Only missing dates are downloaded.
+read_period <- function(day, from, to) {
+  csv_path <- file.path("data", paste0("transfers_", period_id(from, to), ".csv"))
+
+  if (file.exists(csv_path)) {
+    x <- readr::read_csv(
+      csv_path,
+      col_types = readr::cols(
+        token = readr::col_character(),
+        datetime_utc = readr::col_datetime(format = ""),
+        amount = readr::col_double(),
+        hash = readr::col_character(),
+        block = readr::col_integer()
+      ),
+      show_col_types = FALSE
+    )
+  } else {
+    if (!nzchar(trimws(Sys.getenv("ETHERSCAN_API_KEY")))) {
+      stop("The CSV for ", day, " is missing: ", csv_path,
+           ". Add your Etherscan API V2 key to ~/.Renviron and restart R. ",
+           "The 1 October CSV is preserved and will not be downloaded again.")
+    }
+
+    # A direct server check before a large transfer download.
+    tryCatch(block_before(from), error = function(e) {
+      stop("Cannot fetch ", day, ": ", conditionMessage(e), call. = FALSE)
+    })
+
+    events <- lapply(seq_len(nrow(stablecoins)), function(i) {
+      fetch_chunk(stablecoins$token[i], stablecoins$contract[i],
+                  stablecoins$expected_decimals[i], from, to)
+    })
+    x <- dplyr::bind_rows(events)
+    if (nrow(x) == 0L) stop("Etherscan returned no transfers for ", day)
+
+    temp_csv <- paste0(csv_path, ".tmp")
+    readr::write_csv(x, temp_csv)
+    if (!file.rename(temp_csv, csv_path)) {
+      stop("Could not save downloaded CSV: ", csv_path)
+    }
+  }
+
+  if (!nrow(x) || anyNA(x$datetime_utc) || anyNA(x$amount) ||
+      any(x$datetime_utc < from | x$datetime_utc >= to) ||
+      any(!is.finite(x$amount)) || any(x$amount < 0)) {
+    stop("Missing or invalid event data in CSV for ", day)
+  }
+  if (!setequal(unique(x$token), stablecoins$token)) {
+    stop("Not all three stablecoins are represented in the ", day, " CSV")
+  }
+
+  x |> mutate(day = day)
+}
+
+transfers <- purrr::map_dfr(seq_len(nrow(periods)), function(i) {
+  read_period(periods$day[i], periods$start[i], periods$end[i])
+})
+
+stopifnot(nrow(transfers) > 0L)
+collection_summary <- transfers |>
+  count(day, token, name = "transfer_events") |>
+  arrange(day, match(token, stablecoins$token))
+
+knitr::kable(collection_summary, caption = "ERC-20 Transfer events by day and token")
+```
+
+# 2. Transfer sizes
+
+Our first question is about **individual transfer amounts**.Let's do the summary for USDC, USDT and DAI on each date. 
+
+```{r size-summary}
+size_summary <- transfers |>
+  group_by(day, token) |>
+  summarise(
+    transfers = n(),
+    zero_value_events = sum(amount == 0),
+    mean_size = mean(amount),
+    median_size = median(amount),
+    max_size = max(amount),
+    .groups = "drop"
+  ) |>
+  arrange(day, match(token, stablecoins$token))
+
+readr::write_csv(size_summary, "outputs/transfer_size_summary.csv")
+knitr::kable(
+  size_summary |>
+    mutate(across(c(mean_size, median_size, max_size),
+                  ~fmt_number(.x, accuracy = 0.01))),
+  col.names = c("Date (UTC)", "Token", "Events", "Zero-value events",
+                "Mean", "Median", "Maximum"),
+  caption = "Transfer sizes by date (token units)"
+)
+
+size_value <- function(d, token_name, column) {
+  size_summary[size_summary$day == d & size_summary$token == token_name,
+               column, drop = TRUE][[1]]
+}
+```
+
+### Distribution on a logarithmic scale
+
+
+
+The logarithm graph of **all positive values**, showing the minimum and maximum values. On this axis, equal intervals reflect an exponential change: for example, an increase from 10 to 100 is the same as an increase from 100 to 1,000. This makes it easier to compare USDC, USDT, and DAI across a very wide range of transfer amounts.
+
+```{r size-log-density}
+positive <- transfers |> filter(amount > 0)
+if (nrow(positive) == 0L) stop("No positive transfer amounts to plot.")
+
+log_data <- positive |> mutate(log10_amount = log10(amount))
+
+p_log <- ggplot(log_data,
+                aes(x = log10_amount, colour = token, group = token)) +
+  geom_density(linewidth = 1.05, adjust = 1.1, na.rm = TRUE) +
+  facet_wrap(~day, ncol = 1) +
+  scale_x_continuous(
+    breaks = seq(-6, 8, by = 2),
+    labels = function(x) format(10^x, scientific = TRUE, trim = TRUE)
+  ) +
+  labs(
+    title = "Transfer-size distributions — logarithmic scale",
+    subtitle = "All positive transfers; one panel per date",
+    x = "Transfer size (token units, log10 scale)",
+    y = "Density (per log10 unit)", colour = "Stablecoin"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top", panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "bold"))
+print(p_log)
+ggsave("figures/transfer_sizes_log.png", p_log,
+       width = 11, height = 7, dpi = 160)
+```
+
+
+These three curves don't have the same shap. While USDT focuses on low-value transfer fees, USDC tends to focus on high-value fees. The DAI curve is very flat, and it is clear that high-value fees peaked on 1 October. On 2 October, the curves shifted slightly, but USDT continued to grow at a slower rate than USDC, while DAI maintained its leading position in high-value transfers. These curves represent the distribution of transfer volume for each token type; the length of the curve does not indicate the number of transfers or the total amount transferred.
+
+### Cumulative distribution
+
+The cumulative chart gives another perspective: at any point on the horizontal axis, the vertical value is the proportion of positive transfers no larger than that amount. It uses the full positive dataset and does not depend on density smoothing.
+
+```{r size-ecdf}
+ecdf_points <- positive |>
+  group_by(day, token) |>
+  group_modify(~{
+    x <- sort(.x$amount)
+    j <- unique(pmax(1L, round(seq(1, length(x),
+                                length.out = min(3000L, length(x))))))
+    tibble(amount = x[j], cumulative_share = j / length(x))
+  }) |>
+  ungroup()
+
+p_ecdf <- ggplot(ecdf_points,
+                 aes(x = amount, y = cumulative_share,
+                     colour = token, group = token)) +
+  geom_step(linewidth = 0.9) +
+  facet_wrap(~day, ncol = 1) +
+  scale_x_log10(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+  scale_y_continuous(labels = scales::label_percent(), limits = c(0, 1)) +
+  labs(title = "Cumulative distribution of positive transfer sizes",
+       x = "Transfer size (token units, log scale)",
+       y = "Share of positive transfers", colour = "Stablecoin") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top", panel.grid.minor = element_blank())
+print(p_ecdf)
+ggsave("figures/transfer_size_ecdf.png", p_ecdf,
+       width = 11, height = 7, dpi = 160)
+```
+
+The cumulative curves help check the pattern seen in the density plot. On both dates, USDT rises faster through the range of smaller amounts: a larger share of its transfers falls below any given threshold in that range. USDC follows a similar path but is generally shifted towards larger amounts. DAI rises more gradually, particularly on 1 October, showing that a greater share of its transfers is relatively large. The difference narrows on 2 October, although DAI still has the highest median transfer size.
+
+# 3. Transfer volumes
+
+The second question asks how much is transferred in total. We add the recorded amounts for each token over **12:00–13:00 UTC**, separately on 1 and 2 October. We also count the transfer events, since frequent transfers do not necessarily produce the largest volume. These are nominal on-chain token amounts, not exchange trading volume.
+
+```{r volume-summary}
+volume_summary <- transfers |>
+  group_by(day, token) |>
+  summarise(
+    transfers = n(),
+    total_volume = sum(amount),
+    mean_transfer = mean(amount),
+    .groups = "drop"
+  ) |>
+  group_by(day) |>
+  mutate(
+    transfer_share_pct = 100 * transfers / sum(transfers),
+    volume_share_pct = 100 * total_volume / sum(total_volume),
+    volume_millions = total_volume / 1e6
+  ) |>
+  ungroup() |>
+  arrange(day, desc(total_volume))
+
+readr::write_csv(volume_summary, "outputs/transfer_volume_summary.csv")
+knitr::kable(
+  volume_summary |>
+    transmute(day, token,
+              transfers = fmt_number(transfers, accuracy = 1),
+              total_volume = fmt_number(total_volume, accuracy = 0.01),
+              transfer_share_pct = round(transfer_share_pct, 2),
+              volume_share_pct = round(volume_share_pct, 2)),
+  col.names = c("Day (UTC)", "Token", "Transfer events",
+                "Gross volume (token units)", "Event share (%)", "Volume share (%)"),
+  caption = "Transfer frequency and gross volume for each of the two hours"
+)
+
+volume_value <- function(d, token_name, column) {
+  volume_summary[volume_summary$day == d & volume_summary$token == token_name,
+                 column, drop = TRUE][[1]]
+}
+```
+
+### Gross transfer volume
+
+Each stablecoin has two bars, one for each observation hour. All three contracts are compared over the same 60-minute interval on both dates.
+
+```{r volume-barplot}
+p_volume <- ggplot(volume_summary,
+                   aes(x = token, y = volume_millions, fill = day)) +
+  geom_col(position = position_dodge(width = 0.78), width = 0.7) +
+  scale_y_continuous(labels = scales::label_number(),
+                     expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Gross ERC-20 transfer volume by stablecoin",
+       subtitle = "1 and 2 October 2026 · 12:00–13:00 UTC each day",
+       x = "Stablecoin", y = "Volume (millions of token units)", fill = "Date") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+print(p_volume)
+ggsave("figures/transfer_volume_comparison.png", p_volume,
+       width = 10, height = 5.5, dpi = 160)
+```
+
+USDC accounts for the largest gross transfer volume in both observation hours. Its volume falls from about 1.64 billion tokens on 1 October to 1.52 billion on 2 October, but it remains well ahead of the other two stablecoins. USDT moves in the opposite direction, increasing from about 493 million to 699 million tokens. DAI also rises, from about 49 million to 76 million, though its total is still much smaller. The gap between USDC and USDT is therefore narrower on the second day, without changing their ranking by volume.
+
+### Transfer frequency versus volume
+
+The left panel counts transfers, while the right panel adds their amounts. Because they measure different things, the vertical scales are intentionally separate.
+
+```{r count-volume-comparison}
+counts_and_volumes <- volume_summary |>
+  select(day, token, transfers, total_volume) |>
+  pivot_longer(cols = c(transfers, total_volume),
+               names_to = "metric", values_to = "value") |>
+  mutate(metric = recode(metric,
+                         transfers = "Number of Transfer events",
+                         total_volume = "Gross volume (token units)"))
+
+p_counts <- ggplot(counts_and_volumes,
+                   aes(x = token, y = value, fill = day)) +
+  geom_col(position = position_dodge(width = 0.78), width = 0.7) +
+  facet_wrap(~metric, scales = "free_y", ncol = 2) +
+  scale_y_continuous(labels = scales::label_number(
+    scale_cut = scales::cut_short_scale())) +
+  labs(title = "Transfer frequency versus gross volume",
+       subtitle = "Two separate one-hour windows", x = "Stablecoin", y = NULL,
+       fill = "Date") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+print(p_counts)
+ggsave("figures/transfer_counts_vs_volume.png", p_counts,
+       width = 11, height = 5.5, dpi = 160)
+```
+
+The two panels tell different stories. USDT has the most transfer events in both hours, at roughly 30,000 per hour, while USDC has slightly fewer and DAI has far fewer. Yet the ranking changes when we look at the total amount moved: USDC leads by a wide margin on both days. In other words, USDT is transferred more often, but USDC transfers carry more tokens on average. DAI is another useful contrast: its typical transfer is relatively large, but there are too few events for it to approach the others in overall volume.
+
+### Volume within each observation hour
+
+To see what happened within each hour, we group events into six 10-minute intervals. Each date has its own panel. The gap between the two observation days is not included or plotted.
+
+```{r time-volume}
+volume_over_time <- transfers |>
+  mutate(bin_minute = as.integer(format(
+    lubridate::floor_date(datetime_utc, unit = "10 minutes"), "%M", tz = "UTC"))) |>
+  group_by(day, token, bin_minute) |>
+  summarise(volume = sum(amount), transfers = n(), .groups = "drop") |>
+  tidyr::complete(
+    tidyr::nesting(day, token), bin_minute = seq(0L, 50L, by = 10L),
+    fill = list(volume = 0, transfers = 0)
+  )
+
+readr::write_csv(volume_over_time, "outputs/volume_by_10min.csv")
+
+time_breaks <- seq(0L, 50L, by = 10L)
+p_time <- ggplot(volume_over_time,
+                 aes(x = bin_minute, y = volume / 1e6,
+                     colour = token, group = token)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.5) +
+  facet_wrap(~day, ncol = 1) +
+  scale_x_continuous(breaks = time_breaks,
+                     labels = sprintf("12:%02d", time_breaks)) +
+  scale_y_continuous(labels = scales::label_number()) +
+  labs(title = "Gross transfer volume by ten-minute interval",
+       subtitle = "Ethereum mainnet · two independent hours",
+       x = "Time (UTC)", y = "Volume (millions of token units)",
+       colour = "Token") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top", panel.grid.minor = element_blank())
+print(p_time)
+ggsave("figures/volume_by_10min.png", p_time,
+       width = 11, height = 7, dpi = 160)
+```
+
+
+Trading volume can fluctuate even within the space of an hour. On 1 October, USDC continued to outperform USDT and DAI every ten minutes, with a significant difference between 12.20 and 12.50 UTC. On 2 October, the situation was inconsistent: USDC recorded an increase of more than 500 million tokens between 12.30 and 12.40, but subsequently lost significant momentum. USDT was also active during this period, overtaking USDC between 12:40 and 12:50. 
+
+# 4. Conclusion
+
+
+The selected hours show different patterns for the typical transfer amount and for overall activity. DAI has the highest median transfer size on both dates, while USDC carries the greatest gross volume. USDT records the largest number of transfers in both hours. These observations refer specifically to the sampled hours on Ethereum; they do not represent full-day totals.
+
+
